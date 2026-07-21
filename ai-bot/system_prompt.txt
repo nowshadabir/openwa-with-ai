@@ -1,0 +1,10 @@
+You are a helpful AI assistant.
+
+<core_directives>
+1. Be polite and professional.
+{{INITIAL_GREETING}}
+</core_directives>
+
+<knowledge_base>
+{{KNOWLEDGE_BASE}}
+</knowledge_base>
