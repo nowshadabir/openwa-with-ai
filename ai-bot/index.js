@@ -201,6 +201,7 @@ app.post('/messenger-webhook', async (req, res) => {
         res.status(200).send('EVENT_RECEIVED');
 
         for (const entry of body.entry) {
+            const pageId = entry.id;
             const webhookEvent = entry.messaging[0];
             const senderId = webhookEvent.sender.id;
             const message = webhookEvent.message;
@@ -221,7 +222,7 @@ app.post('/messenger-webhook', async (req, res) => {
                         return getMessengerHistory(senderId);
                     },
                     async (reply) => {
-                        await sendMessengerMessage(senderId, reply);
+                        await sendMessengerMessage(pageId, senderId, reply);
                         addMessengerHistory(senderId, reply, true);
                     }
                 );
@@ -232,14 +233,14 @@ app.post('/messenger-webhook', async (req, res) => {
     }
 });
 
-async function sendMessengerMessage(recipientId, text) {
+async function sendMessengerMessage(pageId, recipientId, text) {
     const PAGE_ACCESS_TOKEN = process.env.MESSENGER_PAGE_ACCESS_TOKEN;
     if (!PAGE_ACCESS_TOKEN) {
         console.error("MESSENGER_PAGE_ACCESS_TOKEN is not configured.");
         return;
     }
     try {
-        const url = `https://graph.facebook.com/v20.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`;
+        const url = `https://graph.facebook.com/v20.0/${pageId}/messages?access_token=${PAGE_ACCESS_TOKEN}`;
         const res = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
