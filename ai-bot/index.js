@@ -48,6 +48,56 @@ const getSystemPrompt = (isFirstMessage) => {
         .replace('{{KNOWLEDGE_BASE}}', knowledgeBase);
 };
 
+// Shared AI engine processing function
+async function processChatMessage(chatId, messageText, historySource, replyCallback) {
+    try {
+        console.log(`\n[AI Engine] Processing message from ${chatId}: "${messageText}"`);
+        const history = await historySource();
+
+        // Filter only text messages with content and ignore booking confirmation replies
+        const textHistory = history.filter(h => h.type === 'text' && h.body && !(h.fromMe && h.body.includes('ধন্যবাদ! আমাদের একজন')));
+
+        // Determine if this is a brand new conversation
+        const isFirstMessage = textHistory.length <= 1;
+
+        const messages = [{ role: 'system', content: getSystemPrompt(isFirstMessage) }];
+
+        for (const h of textHistory) {
+            messages.push({
+                role: h.fromMe ? 'assistant' : 'user',
+                content: h.body
+            });
+        }
+
+        if (!messages.find(m => m.content === messageText && m.role === 'user')) {
+            messages.push({ role: 'user', content: messageText });
+        }
+
+        console.log(`Sending to OpenAI API with ${messages.length} messages...`);
+        console.log("Context Messages:", JSON.stringify(messages, null, 2));
+
+        const chatCompletion = await openai.chat.completions.create({
+            messages,
+            model: 'meta-llama/llama-3.3-70b-instruct',
+            temperature: 0.3, // Lowered temperature to prevent hallucination 
+            max_tokens: 2048,
+        });
+
+        const choice = chatCompletion.choices[0];
+        const aiReply = choice?.message?.content;
+        console.log(`[AI Reply]: "${aiReply}"`);
+        console.log(`Finish Reason: ${choice?.finish_reason}, Usage: ${JSON.stringify(chatCompletion.usage)}`);
+        
+        if (aiReply) {
+            await replyCallback(aiReply);
+        }
+    } catch (error) {
+        console.error("Error processing message:", error);
+    }
+}
+
+// === WhatsApp (OpenWA) Webhook & Helpers ===
+
 async function getChatHistory(chatId) {
     if (!SESSION_ID || !OPENWA_API_KEY) return [];
     try {
@@ -96,50 +146,120 @@ app.post('/webhook', async (req, res) => {
             return;
         }
 
-        try {
-            console.log(`\n[Webhook] Received message from ${msg.from}: "${msg.body}"`);
-            const history = await getChatHistory(msg.from);
+        await processChatMessage(
+            msg.from,
+            msg.body,
+            () => getChatHistory(msg.from),
+            (reply) => sendMessage(msg.from, reply)
+        );
+    }
+});
 
-            // Filter only text messages with content and ignore booking confirmation replies
-            const textHistory = history.filter(h => h.type === 'text' && h.body && !(h.fromMe && h.body.includes('ধন্যবাদ! আমাদের একজন')));
+// === Facebook Messenger Webhook & Helpers ===
 
-            // Determine if this is a brand new conversation
-            const isFirstMessage = textHistory.length <= 1;
+const messengerHistory = {};
 
-            const messages = [{ role: 'system', content: getSystemPrompt(isFirstMessage) }];
+function getMessengerHistory(senderId) {
+    if (!messengerHistory[senderId]) {
+        messengerHistory[senderId] = [];
+    }
+    return messengerHistory[senderId];
+}
 
-            for (const h of textHistory) {
-                messages.push({
-                    role: h.fromMe ? 'assistant' : 'user',
-                    content: h.body
-                });
-            }
+function addMessengerHistory(senderId, body, fromMe) {
+    const history = getMessengerHistory(senderId);
+    history.push({
+        type: 'text',
+        body: body,
+        fromMe: fromMe
+    });
+    // Limit history to last 10 messages
+    if (history.length > 10) {
+        history.shift();
+    }
+}
 
-            if (!messages.find(m => m.content === msg.body && m.role === 'user')) {
-                messages.push({ role: 'user', content: msg.body });
-            }
+app.get('/messenger-webhook', (req, res) => {
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
 
-            console.log(`Sending to OpenAI API with ${messages.length} messages...`);
-            console.log("Context Messages:", JSON.stringify(messages, null, 2));
-
-            const chatCompletion = await openai.chat.completions.create({
-                messages,
-                model: 'meta-llama/llama-3.3-70b-instruct',
-                temperature: 0.3, // Lowered temperature to prevent hallucination 
-                max_tokens: 2048,
-            });
-
-            const choice = chatCompletion.choices[0];
-            const aiReply = choice?.message?.content;
-            console.log(`[AI Reply]: "${aiReply}"`);
-            console.log(`Finish Reason: ${choice?.finish_reason}, Usage: ${JSON.stringify(chatCompletion.usage)}`);
-            if (aiReply) await sendMessage(msg.from, aiReply);
-
-        } catch (error) {
-            console.error("Error processing message:", error);
+    if (mode && token) {
+        if (mode === 'subscribe' && token === process.env.MESSENGER_VERIFY_TOKEN) {
+            console.log('Messenger Webhook verified successfully!');
+            res.status(200).send(challenge);
+        } else {
+            res.sendStatus(403);
         }
     }
 });
+
+app.post('/messenger-webhook', async (req, res) => {
+    const body = req.body;
+
+    if (body.object === 'page') {
+        res.status(200).send('EVENT_RECEIVED');
+
+        for (const entry of body.entry) {
+            const webhookEvent = entry.messaging[0];
+            const senderId = webhookEvent.sender.id;
+            const message = webhookEvent.message;
+
+            if (message && message.text) {
+                const userMessage = message.text;
+                console.log(`\n[Messenger Webhook] Received message from ${senderId}: "${userMessage}"`);
+
+                await processChatMessage(
+                    senderId,
+                    userMessage,
+                    async () => {
+                        const history = getMessengerHistory(senderId);
+                        // Add the user message to history before processing (to mimic WhatsApp's behavior)
+                        if (!history.find(h => h.body === userMessage && !h.fromMe)) {
+                            addMessengerHistory(senderId, userMessage, false);
+                        }
+                        return getMessengerHistory(senderId);
+                    },
+                    async (reply) => {
+                        await sendMessengerMessage(senderId, reply);
+                        addMessengerHistory(senderId, reply, true);
+                    }
+                );
+            }
+        }
+    } else {
+        res.sendStatus(404);
+    }
+});
+
+async function sendMessengerMessage(recipientId, text) {
+    const PAGE_ACCESS_TOKEN = process.env.MESSENGER_PAGE_ACCESS_TOKEN;
+    if (!PAGE_ACCESS_TOKEN) {
+        console.error("MESSENGER_PAGE_ACCESS_TOKEN is not configured.");
+        return;
+    }
+    try {
+        const url = `https://graph.facebook.com/v20.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`;
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                recipient: { id: recipientId },
+                message: { text: text }
+            })
+        });
+        if (!res.ok) {
+            const errBody = await res.text();
+            console.error(`Failed to send Messenger message: ${res.status} ${res.statusText}`, errBody);
+        } else {
+            console.log(`Messenger reply successfully sent to ${recipientId}`);
+        }
+    } catch (err) {
+        console.error("Error sending Messenger message:", err);
+    }
+}
+
+// === Server Startup ===
 
 app.listen(PORT, () => {
     console.log(`AI Bot listening on port ${PORT}`);
